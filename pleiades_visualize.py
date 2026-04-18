@@ -28,24 +28,32 @@ plt.rcParams["font.family"] = "DejaVu Sans"
 
 def draw_final_pleiad(left_params, right_params, edges):
     fig, ax = plt.subplots(figsize=(14, 8))
-    ax.set_xlim(-1.5, 3.5)
+    ax.set_xlim(-2.0, 4.0)
 
     max_nodes = max(len(left_params), len(right_params), 1)
     y_start = max_nodes * 2
     ax.set_ylim(-1.5, y_start + 1)
 
     node_coords = {}
+    node_artists = {}
+    edge_artists = []
     top_y = y_start
     bottom_y = y_start - max(max_nodes - 1, 0) * 2
+    default_node_face = "#d9ecff"
+    active_node_face = "#bfdbfe"
+    default_node_edge = "#5b6c7a"
+    active_node_edge = "#2563eb"
+    active_node_name = None
+    drag_offset = (0.0, 0.0)
 
     def draw_node(text, x, y):
         box_style = dict(
             boxstyle="round,pad=0.8",
-            facecolor="#d9ecff",
-            edgecolor="#5b6c7a",
+            facecolor=default_node_face,
+            edgecolor=default_node_edge,
             linewidth=1.6,
         )
-        ax.text(
+        return ax.text(
             x,
             y,
             text,
@@ -57,7 +65,6 @@ def draw_final_pleiad(left_params, right_params, edges):
             zorder=3,
             multialignment="center",
         )
-        return x, y
 
     def calculate_y_positions(items):
         if not items:
@@ -68,20 +75,94 @@ def draw_final_pleiad(left_params, right_params, edges):
         step = (top_y - bottom_y) / (len(items) - 1)
         return [top_y - index * step for index in range(len(items))]
 
+    def update_edge_position(edge_data):
+        start_x, start_y = node_artists[edge_data["start"]].get_position()
+        end_x, end_y = node_artists[edge_data["end"]].get_position()
+        edge_data["line"].set_data([start_x, end_x], [start_y, end_y])
+        edge_data["label"].set_position(
+            ((start_x + end_x) * 0.5, (start_y + end_y) * 0.5)
+        )
+
+    def update_edges_for_node(node_name):
+        for edge_data in edge_artists:
+            if edge_data["start"] == node_name or edge_data["end"] == node_name:
+                update_edge_position(edge_data)
+
+    def set_node_active_state(node_name, is_active):
+        node_patch = node_artists[node_name].get_bbox_patch()
+        if node_patch is None:
+            return
+
+        node_patch.set_facecolor(active_node_face if is_active else default_node_face)
+        node_patch.set_edgecolor(active_node_edge if is_active else default_node_edge)
+        node_patch.set_linewidth(2.2 if is_active else 1.6)
+
+    def find_node_under_cursor(event):
+        for node_name, node_artist in reversed(list(node_artists.items())):
+            contains, _ = node_artist.contains(event)
+            if contains:
+                return node_name
+        return None
+
+    def on_press(event):
+        nonlocal active_node_name, drag_offset
+
+        if (
+            event.button != 1
+            or event.inaxes != ax
+            or event.xdata is None
+            or event.ydata is None
+        ):
+            return
+
+        node_name = find_node_under_cursor(event)
+        if node_name is None:
+            return
+
+        active_node_name = node_name
+        node_x, node_y = node_artists[node_name].get_position()
+        drag_offset = (node_x - event.xdata, node_y - event.ydata)
+        set_node_active_state(node_name, True)
+        fig.canvas.draw_idle()
+
+    def on_motion(event):
+        if active_node_name is None or event.inaxes != ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        new_position = (event.xdata + drag_offset[0], event.ydata + drag_offset[1])
+        node_artists[active_node_name].set_position(new_position)
+        node_coords[active_node_name] = new_position
+        update_edges_for_node(active_node_name)
+        fig.canvas.draw_idle()
+
+    def on_release(event):
+        nonlocal active_node_name
+
+        if active_node_name is None:
+            return
+
+        set_node_active_state(active_node_name, False)
+        active_node_name = None
+        fig.canvas.draw_idle()
+
     for txt, y_pos in zip(left_params, calculate_y_positions(left_params)):
-        node_coords[txt] = draw_node(txt, 0, y_pos)
+        node_coords[txt] = (0, y_pos)
+        node_artists[txt] = draw_node(txt, 0, y_pos)
 
     for txt, y_pos in zip(right_params, calculate_y_positions(right_params)):
-        node_coords[txt] = draw_node(txt, 2, y_pos)
+        node_coords[txt] = (2, y_pos)
+        node_artists[txt] = draw_node(txt, 2, y_pos)
 
     for start_node, end_node, weight in edges:
-        x1, y1 = node_coords[start_node]
-        x2, y2 = node_coords[end_node]
+        x1, y1 = node_artists[start_node].get_position()
+        x2, y2 = node_artists[end_node].get_position()
 
         style = "dashed" if weight < 0 else "solid"
         width = 2 + abs(weight) * 3
 
-        ax.plot(
+        line_artist, = ax.plot(
             [x1, x2],
             [y1, y2],
             color="#334155",
@@ -90,12 +171,9 @@ def draw_final_pleiad(left_params, right_params, edges):
             zorder=1,
         )
 
-        txt_x = x1 + (x2 - x1) * 0.5
-        txt_y = y1 + (y2 - y1) * 0.5
-
-        ax.text(
-            txt_x,
-            txt_y,
+        label_artist = ax.text(
+            x1 + (x2 - x1) * 0.5,
+            y1 + (y2 - y1) * 0.5,
             f"{weight:g}",
             fontsize=11,
             fontweight="bold",
@@ -103,6 +181,14 @@ def draw_final_pleiad(left_params, right_params, edges):
             ha="center",
             va="center",
             zorder=4,
+        )
+        edge_artists.append(
+            {
+                "start": start_node,
+                "end": end_node,
+                "line": line_artist,
+                "label": label_artist,
+            }
         )
 
     legend_elements = [
@@ -121,9 +207,26 @@ def draw_final_pleiad(left_params, right_params, edges):
         edgecolor="#94a3b8",
     )
 
+    ax.text(
+        0.99,
+        0.98,
+        "ЛКМ: перетащить узел",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=10,
+        color="#516274",
+        bbox=dict(facecolor="white", edgecolor="#dbe3ef", alpha=0.95, pad=4),
+        zorder=5,
+    )
+
     plt.title("Корреляционная плеяда", fontsize=18, fontweight="bold", pad=20)
     plt.axis("off")
     plt.tight_layout()
+    fig.canvas.draw()
+    fig.canvas.mpl_connect("button_press_event", on_press)
+    fig.canvas.mpl_connect("motion_notify_event", on_motion)
+    fig.canvas.mpl_connect("button_release_event", on_release)
     plt.show()
 
 
