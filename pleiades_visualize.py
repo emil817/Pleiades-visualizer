@@ -1,6 +1,9 @@
 import csv
 import io
+import posixpath
 import sys
+import zipfile
+import xml.etree.ElementTree as ET
 
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
@@ -9,6 +12,7 @@ from PyQt5.QtGui import QColor, QFont, QKeySequence
 from PyQt5.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -25,16 +29,203 @@ from PyQt5.QtWidgets import (
 
 plt.rcParams["font.family"] = "DejaVu Sans"
 
+XLSX_NS = {
+    "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    "rel": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "pkgrel": "http://schemas.openxmlformats.org/package/2006/relationships",
+}
+
+
+def parse_table_text(text):
+    text = text.replace("\r\n", "\n").strip("\n")
+    if not text.strip():
+        return []
+
+    if "\t" in text:
+        return [line.split("\t") for line in text.split("\n")]
+
+    sample = "\n".join(text.split("\n")[:5])
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=";,")
+        reader = csv.reader(io.StringIO(text), dialect)
+        return [row for row in reader]
+    except csv.Error:
+        return [[line] for line in text.split("\n")]
+
+
+def normalize_table_data(rows):
+    normalized = []
+    for row in rows:
+        normalized.append(
+            [str(cell).strip() if cell is not None else "" for cell in row]
+        )
+
+    while normalized and not any(normalized[-1]):
+        normalized.pop()
+
+    if not normalized:
+        return []
+
+    max_cols = max(len(row) for row in normalized)
+    while max_cols > 0 and all(
+        len(row) <= max_cols - 1 or not row[max_cols - 1] for row in normalized
+    ):
+        max_cols -= 1
+
+    if max_cols <= 0:
+        return []
+
+    return [row[:max_cols] + [""] * (max_cols - len(row)) for row in normalized]
+
+
+def read_csv_table(file_path):
+    for encoding in ("utf-8-sig", "utf-8", "cp1251", "windows-1251"):
+        try:
+            with open(file_path, "r", encoding=encoding, newline="") as source:
+                return normalize_table_data(parse_table_text(source.read()))
+        except UnicodeDecodeError:
+            continue
+
+    raise ValueError("Не удалось прочитать CSV-файл: неизвестная кодировка.")
+
+
+def cell_reference_to_index(cell_reference):
+    letters = "".join(char for char in cell_reference if char.isalpha()).upper()
+    if not letters:
+        return 0
+
+    index = 0
+    for char in letters:
+        index = index * 26 + (ord(char) - ord("A") + 1)
+    return index - 1
+
+
+def extract_xlsx_text(text_parent):
+    if text_parent is None:
+        return ""
+
+    return "".join(
+        node.text or "" for node in text_parent.iter() if node.tag.endswith("}t")
+    )
+
+
+def get_first_sheet_path(archive):
+    workbook_root = ET.fromstring(archive.read("xl/workbook.xml"))
+    workbook_rels_root = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+
+    first_sheet = workbook_root.find("main:sheets/main:sheet", XLSX_NS)
+    if first_sheet is None:
+        raise ValueError("В XLSX-файле не найден ни один лист.")
+
+    relation_id = first_sheet.attrib.get(
+        "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+    )
+    if not relation_id:
+        raise ValueError("Не удалось определить первый лист XLSX-файла.")
+
+    for relation in workbook_rels_root.findall("pkgrel:Relationship", XLSX_NS):
+        if relation.attrib.get("Id") != relation_id:
+            continue
+
+        target = relation.attrib.get("Target", "")
+        if not target:
+            break
+
+        normalized = posixpath.normpath(posixpath.join("xl", target))
+        return normalized
+
+    raise ValueError("Не удалось найти XML первого листа в XLSX-файле.")
+
+
+def read_xlsx_shared_strings(archive):
+    if "xl/sharedStrings.xml" not in archive.namelist():
+        return []
+
+    shared_strings_root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+    return [
+        extract_xlsx_text(string_item)
+        for string_item in shared_strings_root.findall("main:si", XLSX_NS)
+    ]
+
+
+def read_xlsx_table(file_path):
+    try:
+        with zipfile.ZipFile(file_path) as archive:
+            shared_strings = read_xlsx_shared_strings(archive)
+            sheet_path = get_first_sheet_path(archive)
+            sheet_root = ET.fromstring(archive.read(sheet_path))
+    except KeyError as exc:
+        raise ValueError("XLSX-файл имеет неподдерживаемую структуру.") from exc
+    except zipfile.BadZipFile as exc:
+        raise ValueError("Файл не является корректным XLSX-архивом.") from exc
+
+    rows = []
+    for row_element in sheet_root.findall(".//main:sheetData/main:row", XLSX_NS):
+        row_index = max(int(row_element.attrib.get("r", "1")) - 1, 0)
+        while len(rows) <= row_index:
+            rows.append([])
+
+        row_values = rows[row_index]
+        for cell_element in row_element.findall("main:c", XLSX_NS):
+            col_index = cell_reference_to_index(cell_element.attrib.get("r", "A1"))
+            while len(row_values) <= col_index:
+                row_values.append("")
+
+            cell_type = cell_element.attrib.get("t")
+            value_node = cell_element.find("main:v", XLSX_NS)
+
+            if cell_type == "inlineStr":
+                value = extract_xlsx_text(cell_element.find("main:is", XLSX_NS))
+            elif cell_type == "s":
+                shared_index = int(value_node.text) if value_node is not None else -1
+                if 0 <= shared_index < len(shared_strings):
+                    value = shared_strings[shared_index]
+                else:
+                    value = ""
+            elif cell_type == "b":
+                value = (
+                    "TRUE"
+                    if value_node is not None and value_node.text == "1"
+                    else "FALSE"
+                )
+            else:
+                value = value_node.text if value_node is not None else ""
+                if not value:
+                    value = extract_xlsx_text(cell_element.find("main:is", XLSX_NS))
+
+            row_values[col_index] = value
+
+    return normalize_table_data(rows)
+
+
+def read_table_file(file_path):
+    lowered = file_path.lower()
+    if lowered.endswith(".csv"):
+        rows = read_csv_table(file_path)
+    elif lowered.endswith(".xlsx"):
+        rows = read_xlsx_table(file_path)
+    else:
+        raise ValueError("Поддерживаются только файлы CSV и XLSX.")
+
+    if not rows:
+        raise ValueError("Файл не содержит данных.")
+
+    return rows
+
 
 def draw_final_pleiad(left_params, right_params, edges):
     fig, ax = plt.subplots(figsize=(14, 8))
     ax.set_xlim(-2.0, 4.0)
 
-    max_nodes = max(len(left_params), len(right_params), 1)
+    shared_node_names = set(left_params) & set(right_params)
+    left_only = [name for name in left_params if name not in shared_node_names]
+    shared_nodes = [name for name in left_params if name in shared_node_names]
+    right_only = [name for name in right_params if name not in shared_node_names]
+
+    max_nodes = max(len(left_only), len(shared_nodes), len(right_only), 1)
     y_start = max_nodes * 2
     ax.set_ylim(-1.5, y_start + 1)
 
-    node_coords = {}
     node_artists = {}
     edge_artists = []
     top_y = y_start
@@ -75,18 +266,64 @@ def draw_final_pleiad(left_params, right_params, edges):
         step = (top_y - bottom_y) / (len(items) - 1)
         return [top_y - index * step for index in range(len(items))]
 
-    def update_edge_position(edge_data):
+    def relayout_edge_labels():
+        if not edge_artists:
+            return
+
+        positions = [list(edge_data["base_label_position"]) for edge_data in edge_artists]
+        min_dx = 0.28
+        min_dy = 0.52
+
+        for _ in range(18):
+            moved = False
+            for left_index in range(len(positions)):
+                for right_index in range(left_index + 1, len(positions)):
+                    dx = positions[right_index][0] - positions[left_index][0]
+                    dy = positions[right_index][1] - positions[left_index][1]
+                    if abs(dx) >= min_dx or abs(dy) >= min_dy:
+                        continue
+
+                    overlap_x = min_dx - abs(dx)
+                    overlap_y = min_dy - abs(dy)
+                    shift_x = (overlap_x / 2 + 0.02) * 0.25
+                    shift_y = overlap_y / 2 + 0.03
+
+                    if dx >= 0:
+                        positions[left_index][0] -= shift_x
+                        positions[right_index][0] += shift_x
+                    else:
+                        positions[left_index][0] += shift_x
+                        positions[right_index][0] -= shift_x
+
+                    if dy >= 0:
+                        positions[left_index][1] -= shift_y
+                        positions[right_index][1] += shift_y
+                    else:
+                        positions[left_index][1] += shift_y
+                        positions[right_index][1] -= shift_y
+
+                    moved = True
+
+            if not moved:
+                break
+
+        for edge_data, position in zip(edge_artists, positions):
+            edge_data["label"].set_position(tuple(position))
+
+    def update_edge_geometry(edge_data):
         start_x, start_y = node_artists[edge_data["start"]].get_position()
         end_x, end_y = node_artists[edge_data["end"]].get_position()
         edge_data["line"].set_data([start_x, end_x], [start_y, end_y])
-        edge_data["label"].set_position(
-            ((start_x + end_x) * 0.5, (start_y + end_y) * 0.5)
+        edge_data["base_label_position"] = (
+            (start_x + end_x) * 0.5,
+            (start_y + end_y) * 0.5,
         )
 
     def update_edges_for_node(node_name):
         for edge_data in edge_artists:
             if edge_data["start"] == node_name or edge_data["end"] == node_name:
-                update_edge_position(edge_data)
+                update_edge_geometry(edge_data)
+        relayout_edge_labels()
 
     def set_node_active_state(node_name, is_active):
         node_patch = node_artists[node_name].get_bbox_patch()
@@ -131,9 +368,9 @@ def draw_final_pleiad(left_params, right_params, edges):
         if event.xdata is None or event.ydata is None:
             return
 
-        new_position = (event.xdata + drag_offset[0], event.ydata + drag_offset[1])
-        node_artists[active_node_name].set_position(new_position)
-        node_coords[active_node_name] = new_position
+        node_artists[active_node_name].set_position(
+            (event.xdata + drag_offset[0], event.ydata + drag_offset[1])
+        )
         update_edges_for_node(active_node_name)
         fig.canvas.draw_idle()
 
@@ -147,13 +384,14 @@ def draw_final_pleiad(left_params, right_params, edges):
         active_node_name = None
         fig.canvas.draw_idle()
 
-    for txt, y_pos in zip(left_params, calculate_y_positions(left_params)):
-        node_coords[txt] = (0, y_pos)
-        node_artists[txt] = draw_node(txt, 0, y_pos)
+    for node_name, y_pos in zip(left_only, calculate_y_positions(left_only)):
+        node_artists[node_name] = draw_node(node_name, 0, y_pos)
 
-    for txt, y_pos in zip(right_params, calculate_y_positions(right_params)):
-        node_coords[txt] = (2, y_pos)
-        node_artists[txt] = draw_node(txt, 2, y_pos)
+    for node_name, y_pos in zip(shared_nodes, calculate_y_positions(shared_nodes)):
+        node_artists[node_name] = draw_node(node_name, 1, y_pos)
+
+    for node_name, y_pos in zip(right_only, calculate_y_positions(right_only)):
+        node_artists[node_name] = draw_node(node_name, 2, y_pos)
 
     for start_node, end_node, weight in edges:
         x1, y1 = node_artists[start_node].get_position()
@@ -172,8 +410,8 @@ def draw_final_pleiad(left_params, right_params, edges):
         )
 
         label_artist = ax.text(
-            x1 + (x2 - x1) * 0.5,
-            y1 + (y2 - y1) * 0.5,
+            (x1 + x2) * 0.5,
+            (y1 + y2) * 0.5,
             f"{weight:g}",
             fontsize=11,
             fontweight="bold",
@@ -182,18 +420,34 @@ def draw_final_pleiad(left_params, right_params, edges):
             va="center",
             zorder=4,
         )
-        edge_artists.append(
-            {
-                "start": start_node,
-                "end": end_node,
-                "line": line_artist,
-                "label": label_artist,
-            }
-        )
+        edge_data = {
+            "start": start_node,
+            "end": end_node,
+            "line": line_artist,
+            "label": label_artist,
+            "base_label_position": ((x1 + x2) * 0.5, (y1 + y2) * 0.5),
+        }
+        edge_artists.append(edge_data)
+
+    relayout_edge_labels()
 
     legend_elements = [
-        Line2D([0], [0], color="#334155", lw=2, linestyle="solid", label="Положительная корреляция"),
-        Line2D([0], [0], color="#334155", lw=2, linestyle="dashed", label="Отрицательная корреляция"),
+        Line2D(
+            [0],
+            [0],
+            color="#334155",
+            lw=2,
+            linestyle="solid",
+            label="Положительная корреляция",
+        ),
+        Line2D(
+            [0],
+            [0],
+            color="#334155",
+            lw=2,
+            linestyle="dashed",
+            label="Отрицательная корреляция",
+        ),
     ]
 
     ax.legend(
@@ -207,18 +461,9 @@ def draw_final_pleiad(left_params, right_params, edges):
         edgecolor="#94a3b8",
     )
 
-    ax.text(
-        0.99,
-        0.98,
-        "ЛКМ: перетащить узел",
-        transform=ax.transAxes,
-        ha="right",
-        va="top",
-        fontsize=10,
-        color="#516274",
-        bbox=dict(facecolor="white", edgecolor="#dbe3ef", alpha=0.95, pad=4),
-        zorder=5,
-    )
+    manager = getattr(fig.canvas, "manager", None)
+    if manager is not None and hasattr(manager, "set_window_title"):
+        manager.set_window_title("Корреляционная плеяда - ЛКМ: перетащить узел")
 
     plt.title("Корреляционная плеяда", fontsize=18, fontweight="bold", pad=20)
     plt.axis("off")
@@ -271,20 +516,7 @@ class PasteTableWidget(QTableWidget):
         super().keyPressEvent(event)
 
     def parse_clipboard_text(self, text):
-        text = text.replace("\r\n", "\n").strip("\n")
-        if not text.strip():
-            return []
-
-        if "\t" in text:
-            return [line.split("\t") for line in text.split("\n")]
-
-        sample = "\n".join(text.split("\n")[:5])
-        try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=";,")
-            reader = csv.reader(io.StringIO(text), dialect)
-            return [row for row in reader]
-        except csv.Error:
-            return [[line] for line in text.split("\n")]
+        return parse_table_text(text)
 
     def paste_from_clipboard(self):
         clipboard_text = QApplication.clipboard().text()
@@ -307,6 +539,31 @@ class PasteTableWidget(QTableWidget):
                     item = QTableWidgetItem("")
                     self.setItem(start_row + row_offset, start_col + col_offset, item)
                 item.setText(value.strip())
+
+        self.apply_table_chrome()
+
+    def set_text_matrix(self, matrix):
+        if not matrix:
+            self.clear_contents_only()
+            return
+
+        row_count = len(matrix)
+        col_count = max(len(row) for row in matrix)
+        self.resize_with_preserved_values(row_count, col_count)
+
+        for row_index in range(row_count):
+            for col_index in range(col_count):
+                item = self.item(row_index, col_index)
+                if item is None:
+                    item = QTableWidgetItem("")
+                    self.setItem(row_index, col_index, item)
+
+                value = (
+                    matrix[row_index][col_index]
+                    if col_index < len(matrix[row_index])
+                    else ""
+                )
+                item.setText(value)
 
         self.apply_table_chrome()
 
@@ -409,8 +666,9 @@ class AppGUI(QWidget):
         title = QLabel("Корреляционная таблица")
         title.setObjectName("titleLabel")
         subtitle = QLabel(
-            "Можно работать в двух форматах: как с матрицей корреляций или как со списком связей из 3 столбцов. "
-            "Обе вкладки поддерживают вставку таблицы из Excel или Google Sheets через Ctrl+V."
+            "Можно работать в двух форматах: как с матрицей корреляций или как со списком "
+            "связей из 3 столбцов. Обе вкладки поддерживают вставку таблицы из Excel или "
+            "Google Sheets через Ctrl+V."
         )
         subtitle.setWordWrap(True)
         subtitle.setObjectName("subtitleLabel")
@@ -436,8 +694,11 @@ class AppGUI(QWidget):
         layout.setSpacing(16)
 
         controls_card = QFrame()
-        controls_layout = QHBoxLayout(controls_card)
-        controls_layout.setContentsMargins(18, 14, 18, 14)
+        card_layout = QVBoxLayout(controls_card)
+        card_layout.setContentsMargins(18, 14, 18, 14)
+        card_layout.setSpacing(12)
+
+        controls_layout = QHBoxLayout()
         controls_layout.setSpacing(12)
 
         rows_label = QLabel("Строк:")
@@ -453,6 +714,9 @@ class AppGUI(QWidget):
         resize_button = QPushButton("Изменить размер")
         resize_button.clicked.connect(self.resize_table)
 
+        import_button = QPushButton("Открыть CSV/XLSX")
+        import_button.clicked.connect(self.import_matrix_file)
+
         paste_button = QPushButton("Вставить из буфера")
         paste_button.clicked.connect(self.table_paste)
 
@@ -466,14 +730,17 @@ class AppGUI(QWidget):
         hint.setObjectName("hintLabel")
         hint.setWordWrap(True)
 
+        card_layout.addWidget(hint)
         controls_layout.addWidget(rows_label)
         controls_layout.addWidget(self.rows_spin)
         controls_layout.addWidget(cols_label)
         controls_layout.addWidget(self.cols_spin)
         controls_layout.addWidget(resize_button)
+        controls_layout.addWidget(import_button)
         controls_layout.addWidget(paste_button)
         controls_layout.addWidget(clear_button)
-        controls_layout.addWidget(hint, 1)
+        controls_layout.addStretch(1)
+        card_layout.addLayout(controls_layout)
         layout.addWidget(controls_card)
 
         self.table = PasteTableWidget(self.rows_count + 1, self.cols_count + 1)
@@ -489,12 +756,18 @@ class AppGUI(QWidget):
         layout.setSpacing(16)
 
         controls_card = QFrame()
-        controls_layout = QHBoxLayout(controls_card)
-        controls_layout.setContentsMargins(18, 14, 18, 14)
+        card_layout = QVBoxLayout(controls_card)
+        card_layout.setContentsMargins(18, 14, 18, 14)
+        card_layout.setSpacing(12)
+
+        controls_layout = QHBoxLayout()
         controls_layout.setSpacing(12)
 
         add_rows_button = QPushButton("Добавить 5 строк")
         add_rows_button.clicked.connect(self.add_edge_rows)
+
+        import_button = QPushButton("Открыть CSV/XLSX")
+        import_button.clicked.connect(self.import_edge_file)
 
         paste_button = QPushButton("Вставить из буфера")
         paste_button.clicked.connect(self.edge_table_paste)
@@ -503,16 +776,19 @@ class AppGUI(QWidget):
         clear_button.clicked.connect(self.clear_edge_table)
 
         hint = QLabel(
-            "Каждая строка описывает одну связь: параметр 1, параметр 2 и корреляция между ними. "
-            "Первый столбец станет левой группой, второй столбец правой."
+            "Каждая строка описывает одну связь: параметр 1, параметр 2 и корреляция "
+            "между ними. Первый столбец станет левой группой, второй столбец правой."
         )
         hint.setObjectName("hintLabel")
         hint.setWordWrap(True)
 
+        card_layout.addWidget(hint)
         controls_layout.addWidget(add_rows_button)
+        controls_layout.addWidget(import_button)
         controls_layout.addWidget(paste_button)
         controls_layout.addWidget(clear_button)
-        controls_layout.addWidget(hint, 1)
+        controls_layout.addStretch(1)
+        card_layout.addLayout(controls_layout)
         layout.addWidget(controls_card)
 
         self.edge_table = PasteTableWidget(
@@ -615,6 +891,27 @@ class AppGUI(QWidget):
             """
         )
 
+    def import_table_into_widget(self, target_widget):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Открыть таблицу",
+            "",
+            "Таблицы (*.csv *.xlsx);;CSV (*.csv);;Excel (*.xlsx)",
+        )
+        if not file_path:
+            return
+
+        try:
+            target_widget.set_text_matrix(read_table_file(file_path))
+        except ValueError as error:
+            QMessageBox.warning(self, "Ошибка импорта", str(error))
+
+    def import_matrix_file(self):
+        self.import_table_into_widget(self.table)
+
+    def import_edge_file(self):
+        self.import_table_into_widget(self.edge_table)
+
     def resize_table(self):
         rows = self.rows_spin.value() + 1
         cols = self.cols_spin.value() + 1
@@ -657,13 +954,21 @@ class AppGUI(QWidget):
         col_count = len(matrix[0]) if matrix else 0
 
         if row_count < 2 or col_count < 2:
-            raise ValueError("Таблица должна содержать хотя бы одну строку и один столбец данных.")
+            raise ValueError(
+                "Таблица должна содержать хотя бы одну строку и один столбец данных."
+            )
 
-        left_params = [matrix[row][0].strip() for row in range(1, row_count) if matrix[row][0].strip()]
-        right_params = [matrix[0][col].strip() for col in range(1, col_count) if matrix[0][col].strip()]
+        left_params = [
+            matrix[row][0].strip() for row in range(1, row_count) if matrix[row][0].strip()
+        ]
+        right_params = [
+            matrix[0][col].strip() for col in range(1, col_count) if matrix[0][col].strip()
+        ]
 
         if not left_params or not right_params:
-            raise ValueError("Заполните хотя бы одно название строки и одно название столбца.")
+            raise ValueError(
+                "Заполните хотя бы одно название строки и одно название столбца."
+            )
 
         edges = []
         for row in range(1, row_count):
@@ -675,13 +980,18 @@ class AppGUI(QWidget):
 
                 col_name = matrix[0][col].strip()
                 if not row_name or not col_name:
-                    raise ValueError(f"Для значения '{value_text}' нужна подпись строки и столбца.")
+                    raise ValueError(
+                        f"Для значения '{value_text}' нужна подпись строки и столбца."
+                    )
+                if row_name == col_name:
+                    continue
 
                 try:
                     weight = float(value_text.replace(",", "."))
                 except ValueError as exc:
                     raise ValueError(
-                        f"Некорректное число: '{value_text}' в строке {row + 1}, столбце {col + 1}."
+                        f"Некорректное число: '{value_text}' в строке {row + 1}, "
+                        f"столбце {col + 1}."
                     ) from exc
 
                 edges.append((row_name, col_name, weight))
@@ -711,7 +1021,9 @@ class AppGUI(QWidget):
             value_text = row[2].strip() if len(row) > 2 else ""
 
             if not param_1 or not param_2 or not value_text:
-                raise ValueError(f"В строке списка связей {index} должны быть заполнены все 3 столбца.")
+                raise ValueError(
+                    f"В строке списка связей {index} должны быть заполнены все 3 столбца."
+                )
 
             try:
                 weight = float(value_text.replace(",", "."))
