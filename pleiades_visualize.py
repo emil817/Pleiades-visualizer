@@ -235,6 +235,7 @@ def draw_final_pleiad(left_params, right_params, edges):
     default_node_edge = "#5b6c7a"
     active_node_edge = "#2563eb"
     active_node_name = None
+    active_label_edge = None
     drag_offset = (0.0, 0.0)
 
     def draw_node(text, x, y):
@@ -266,11 +267,52 @@ def draw_final_pleiad(left_params, right_params, edges):
         step = (top_y - bottom_y) / (len(items) - 1)
         return [top_y - index * step for index in range(len(items))]
 
+    def get_edge_endpoints(edge_data):
+        start_x, start_y = node_artists[edge_data["start"]].get_position()
+        end_x, end_y = node_artists[edge_data["end"]].get_position()
+        return start_x, start_y, end_x, end_y
+
+    def get_point_on_edge(edge_data, t_value):
+        start_x, start_y, end_x, end_y = get_edge_endpoints(edge_data)
+        return (
+            start_x + (end_x - start_x) * t_value,
+            start_y + (end_y - start_y) * t_value,
+        )
+
+    def project_point_to_edge(edge_data, x_pos, y_pos):
+        start_x, start_y, end_x, end_y = get_edge_endpoints(edge_data)
+        dx = end_x - start_x
+        dy = end_y - start_y
+        length_squared = dx * dx + dy * dy
+        if length_squared == 0:
+            return 0.5, (start_x, start_y)
+
+        t_value = ((x_pos - start_x) * dx + (y_pos - start_y) * dy) / length_squared
+        t_value = min(max(t_value, 0.05), 0.95)
+        return t_value, (
+            start_x + dx * t_value,
+            start_y + dy * t_value,
+        )
+
     def relayout_edge_labels():
         if not edge_artists:
             return
 
-        positions = [list(edge_data["base_label_position"]) for edge_data in edge_artists]
+        auto_edges = []
+        positions = []
+        for edge_data in edge_artists:
+            edge_data["base_label_position"] = get_point_on_edge(
+                edge_data, edge_data["label_t"]
+            )
+            if edge_data["manual_label"]:
+                edge_data["label"].set_position(edge_data["base_label_position"])
+            else:
+                auto_edges.append(edge_data)
+                positions.append(list(edge_data["base_label_position"]))
+
+        if not auto_edges:
+            return
+
         min_dx = 0.28
         min_dy = 0.52
 
@@ -307,17 +349,13 @@ def draw_final_pleiad(left_params, right_params, edges):
             if not moved:
                 break
 
-        for edge_data, position in zip(edge_artists, positions):
+        for edge_data, position in zip(auto_edges, positions):
             edge_data["label"].set_position(tuple(position))
 
     def update_edge_geometry(edge_data):
-        start_x, start_y = node_artists[edge_data["start"]].get_position()
-        end_x, end_y = node_artists[edge_data["end"]].get_position()
+        start_x, start_y, end_x, end_y = get_edge_endpoints(edge_data)
         edge_data["line"].set_data([start_x, end_x], [start_y, end_y])
-        edge_data["base_label_position"] = (
-            (start_x + end_x) * 0.5,
-            (start_y + end_y) * 0.5,
-        )
+        edge_data["base_label_position"] = get_point_on_edge(edge_data, edge_data["label_t"])
 
     def update_edges_for_node(node_name):
         for edge_data in edge_artists:
@@ -334,6 +372,14 @@ def draw_final_pleiad(left_params, right_params, edges):
         node_patch.set_edgecolor(active_node_edge if is_active else default_node_edge)
         node_patch.set_linewidth(2.2 if is_active else 1.6)
 
+    def set_label_active_state(edge_data, is_active):
+        label_patch = edge_data["label"].get_bbox_patch()
+        if label_patch is None:
+            return
+
+        label_patch.set_edgecolor("#2563eb" if is_active else "none")
+        label_patch.set_linewidth(1.4 if is_active else 0.0)
+
     def find_node_under_cursor(event):
         for node_name, node_artist in reversed(list(node_artists.items())):
             contains, _ = node_artist.contains(event)
@@ -341,8 +387,15 @@ def draw_final_pleiad(left_params, right_params, edges):
                 return node_name
         return None
 
+    def find_label_under_cursor(event):
+        for edge_data in reversed(edge_artists):
+            contains, _ = edge_data["label"].contains(event)
+            if contains:
+                return edge_data
+        return None
+
     def on_press(event):
-        nonlocal active_node_name, drag_offset
+        nonlocal active_node_name, active_label_edge, drag_offset
 
         if (
             event.button != 1
@@ -350,6 +403,13 @@ def draw_final_pleiad(left_params, right_params, edges):
             or event.xdata is None
             or event.ydata is None
         ):
+            return
+
+        label_edge = find_label_under_cursor(event)
+        if label_edge is not None:
+            active_label_edge = label_edge
+            set_label_active_state(label_edge, True)
+            fig.canvas.draw_idle()
             return
 
         node_name = find_node_under_cursor(event)
@@ -363,9 +423,23 @@ def draw_final_pleiad(left_params, right_params, edges):
         fig.canvas.draw_idle()
 
     def on_motion(event):
-        if active_node_name is None or event.inaxes != ax:
+        if event.inaxes != ax:
             return
         if event.xdata is None or event.ydata is None:
+            return
+
+        if active_label_edge is not None:
+            t_value, projected_point = project_point_to_edge(
+                active_label_edge, event.xdata, event.ydata
+            )
+            active_label_edge["label_t"] = t_value
+            active_label_edge["manual_label"] = True
+            active_label_edge["base_label_position"] = projected_point
+            active_label_edge["label"].set_position(projected_point)
+            fig.canvas.draw_idle()
+            return
+
+        if active_node_name is None:
             return
 
         node_artists[active_node_name].set_position(
@@ -375,7 +449,13 @@ def draw_final_pleiad(left_params, right_params, edges):
         fig.canvas.draw_idle()
 
     def on_release(event):
-        nonlocal active_node_name
+        nonlocal active_node_name, active_label_edge
+
+        if active_label_edge is not None:
+            set_label_active_state(active_label_edge, False)
+            active_label_edge = None
+            fig.canvas.draw_idle()
+            return
 
         if active_node_name is None:
             return
@@ -425,6 +505,8 @@ def draw_final_pleiad(left_params, right_params, edges):
             "end": end_node,
             "line": line_artist,
             "label": label_artist,
+            "label_t": 0.5,
+            "manual_label": False,
             "base_label_position": ((x1 + x2) * 0.5, (y1 + y2) * 0.5),
         }
         edge_artists.append(edge_data)
