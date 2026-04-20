@@ -8,8 +8,8 @@
 
 Интерфейс:
 
-!(Интерфейс)[img/interface.png]
+![Интерфейс](https://github.com/emil817/Pleiades-visualizer/blob/main/img/interface.png)
 
 Пример работы:
 
-!(Пример работы)[img/example.png]
+![Пример работы](https://github.com/emil817/Pleiades-visualizer/blob/main/img/example.png)
