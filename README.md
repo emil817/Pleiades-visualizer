@@ -7,7 +7,9 @@
 - Список свзяей
 
 Интерфейс:
-![[img/interface.png]]
+
+!(Интерфейс)[img/interface.png]
 
 Пример работы:
-![[img/example.png]]
+
+!(Пример работы)[img/example.png]
