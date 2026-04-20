@@ -6,10 +6,10 @@
 - Корреляционная матрица
 - Список свзяей
 
-Интерфейс:
+**Интерфейс:**
 
 ![Интерфейс](https://github.com/emil817/Pleiades-visualizer/blob/main/img/interface.png)
 
-Пример работы:
+**Пример работы:**
 
 ![Пример работы](https://github.com/emil817/Pleiades-visualizer/blob/main/img/example.png)
